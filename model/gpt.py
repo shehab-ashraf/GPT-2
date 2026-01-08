@@ -1,4 +1,3 @@
-from numpy.lib._arraysetops_impl import isin
 from dataclasses import dataclass 
 import torch
 import torch.nn as nn
@@ -86,7 +85,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.embd_size)  # Pre-normalization for MLP
         self.mlp = MLP(config)
-        self.attn_scale = 1 / (2 * config.num_layer) ** 0.5
+        self.attn_scale = 1 / (2 * config.num_layers) ** 0.5
     
     def forward(self, x):
         # Attention with residual connection (pre-norm style)
@@ -124,7 +123,7 @@ class GPT(nn.Module):
         if isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets, return_logits=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, block size is only {self.config.context_length}"
@@ -139,7 +138,7 @@ class GPT(nn.Module):
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_logits:
+            return logits, loss
+        return None, loss
