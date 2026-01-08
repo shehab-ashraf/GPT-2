@@ -1,3 +1,4 @@
+from numpy.lib._arraysetops_impl import isin
 from dataclasses import dataclass 
 import torch
 import torch.nn as nn
@@ -85,10 +86,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.embd_size)  # Pre-normalization for MLP
         self.mlp = MLP(config)
+        self.attn_scale = 1 / (2 * config.n_layer) ** 0.5
     
     def forward(self, x):
         # Attention with residual connection (pre-norm style)
-        x = x + self.attn(self.ln_1(x))
+        x = x + self.attn_scale * self.attn(self.ln_1(x))
         # MLP with residual connection (pre-norm style)
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -111,6 +113,16 @@ class GPT(nn.Module):
 
         # weight sharing scheme (reduces 768*50267=~40M params, fewer params, more efficient)
         self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
