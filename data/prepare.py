@@ -54,9 +54,9 @@ def main():
     if args.out_dir:
         out_dir = args.out_dir
     elif args.total_tokens == 20_000_000:
-        out_dir = "fineweb20M"
+        out_dir = "data/fineweb20M"
     else:
-        out_dir = "fineweb10B"
+        out_dir = "data/fineweb10B"
         
     os.makedirs(out_dir, exist_ok=True)
 
