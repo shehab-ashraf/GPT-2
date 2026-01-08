@@ -2,14 +2,14 @@ import numpy as np
 import torch
 import os
 
-def load_tokens_bin(filename, dtype=np.int32, offset_bytes=0):
+def load_tokens_bin(filename, dtype=np.uint16, offset_bytes=256):
     npt = np.memmap(
         filename,
         dtype=dtype,
         mode="r",
         offset=offset_bytes
     )
-    return torch.from_numpy(npt).long()
+    return torch.from_numpy(npt.astype(np.int32)).long()
 
 class TokenDataLoader:
     
