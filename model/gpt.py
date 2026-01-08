@@ -108,4 +108,23 @@ class GPT(nn.Module):
         ))
         # Language modeling head: maps embeddings back to vocabulary logits
         self.lm_head = nn.Linear(config.embd_size, config.vocab_size, bias=False)
-
+    
+    def forward(self, idx, targets=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, block size is only {self.config.context_length}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
