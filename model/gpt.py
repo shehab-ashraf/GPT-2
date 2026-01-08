@@ -108,6 +108,9 @@ class GPT(nn.Module):
         ))
         # Language modeling head: maps embeddings back to vocabulary logits
         self.lm_head = nn.Linear(config.embd_size, config.vocab_size, bias=False)
+
+        # weight sharing scheme (reduces 768*50267=~40M params, fewer params, more efficient)
+        self.transformer.wte.weight = self.lm_head.weight
     
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
