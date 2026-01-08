@@ -86,7 +86,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.embd_size)  # Pre-normalization for MLP
         self.mlp = MLP(config)
-        self.attn_scale = 1 / (2 * config.n_layer) ** 0.5
+        self.attn_scale = 1 / (2 * config.num_layer) ** 0.5
     
     def forward(self, x):
         # Attention with residual connection (pre-norm style)
