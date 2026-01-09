@@ -7,7 +7,7 @@ from data.dataloader import TokenDataLoader
 
 # Hyperparameters
 total_batch_size = 524288 # 2**19 tokens per optimizer step
-batch_size = 64 # micro-batch size
+batch_size = 32 # micro-batch size
 sequence_length = 1024
 max_steps = 38 # 20M tokens / 524288 approx 38 steps
 device = "cuda" if torch.cuda.is_available() else "cpu"
