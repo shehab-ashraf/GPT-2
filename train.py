@@ -34,7 +34,7 @@ model = GPT(config)
 model.to(device)
 
 # Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # Training Loop
 model.train()
@@ -59,9 +59,6 @@ while step < max_steps:
         # Backward pass
         loss.backward()
     
-    # Norm clipping
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
     optimizer.step()
     
     # Sync if using GPU
@@ -77,4 +74,3 @@ while step < max_steps:
     
     step += 1
 
-print("Training finished.")
