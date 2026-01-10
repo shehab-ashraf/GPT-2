@@ -1,0 +1,314 @@
+@dataclass
+class GPTConfig:
+    """Configuration for GPT model architecture."""
+    context_length: int = 1024  # Maximum sequence length
+    vocab_size: int = 50257     # Size of vocabulary
+    num_layers: int = 12        # Number of transformer blocks
+    embd_size: int = 768        # Embedding dimension
+    num_heads: int = 12         # Number of attention heads
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention layer for autoregressive modeling."""
+
+    def __init__(self, config):
+        super().__init__()
+        # Ensure embedding dimension is evenly divisible across all attention heads
+        assert config.embd_size % config.num_heads == 0, f"embedding dim should be divisible by number of heads"
+        # Key, query, value projections for all heads in a single batch operation
+        self.c_attn = nn.Linear(config.embd_size, 3 * config.embd_size)
+        # Output projection to bring multi-head results back to embedding dimension
+        self.c_proj = nn.Linear(config.embd_size, config.embd_size)
+        self.n_head = config.num_heads
+        self.n_embed = config.embd_size
+        
+        # Causal mask: lower triangular matrix to prevent attending to future tokens
+        self.register_buffer("mask", torch.tril(torch.ones(config.context_length, config.context_length))
+                                     .view(1, 1, config.context_length, config.context_length))
+        
+    def forward(self, x):
+        B, T, C = x.size()  # Batch size, sequence length, embedding dimension
+        
+        # Compute query, key, value for all heads in one go
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embed, dim=2)
+        
+        # Reshape and transpose to separate heads: (B, T, C) -> (B, n_head, T, head_size)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        
+        # Compute scaled dot-product attention scores
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # Apply causal mask to prevent attending to future positions
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        
+        # Apply attention to values: (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = att @ v
+        # Concatenate all heads back together: (B, nh, T, hs) -> (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # Final output projection
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    """Feed-forward network with GELU activation (4x expansion factor)."""
+
+    def __init__(self, config):
+        super().__init__()
+        # Expand to 4x embedding dimension
+        self.c_fc = nn.Linear(config.embd_size, 4 * config.embd_size)
+        self.gelu = nn.GELU()
+        # Project back to embedding dimension
+        self.c_proj = nn.Linear(4 * config.embd_size, config.embd_size)
+    
+    def forward(self, x):
+        x = self.c_fc(x)      # Expand
+        x = self.gelu(x)       # Non-linear activation
+        x = self.c_proj(x)     # Project back
+        return x
+
+class Block(nn.Module):
+    """Transformer block: LayerNorm -> Attention -> LayerNorm -> MLP, with residual connections."""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.embd_size)  # Pre-normalization for attention
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.embd_size)  # Pre-normalization for MLP
+        self.mlp = MLP(config)
+        self.attn_scale = 1 / (2 * config.num_layers) ** 0.5
+    
+    def forward(self, x):
+        # Attention with residual connection (pre-norm style)
+        x = x + self.attn_scale * self.attn(self.ln_1(x))
+        # MLP with residual connection (pre-norm style)
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+class GPT(nn.Module):
+    """GPT Language Model: token + position embeddings -> transformer blocks -> language modeling head."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.embd_size),    # Token embeddings
+            wpe = nn.Embedding(config.context_length, config.embd_size),  # Position embeddings
+            h = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),  # Transformer blocks
+            ln_f = nn.LayerNorm(config.embd_size)  # Final layer norm before output
+        ))
+        # Language modeling head: maps embeddings back to vocabulary logits
+        self.lm_head = nn.Linear(config.embd_size, config.vocab_size, bias=False)
+
+        # weight sharing scheme (reduces 768*50267=~40M params, fewer params, more efficient)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, idx, targets, return_logits=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, block size is only {self.config.context_length}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_logits:
+            return logits, loss
+        return None, loss
+
+#------------------------------------------------------------------------------
+def load_tokens_bin(filename, dtype=np.uint16, offset_bytes=256):
+    npt = np.memmap(
+        filename,
+        dtype=dtype,
+        mode="r",
+        offset=offset_bytes
+    )
+    return torch.from_numpy(npt.astype(np.int32)).long()
+
+class TokenDataLoader:
+    
+    def __init__(self, data_root, B, T):
+        self.B = B
+        self.T = T
+
+        shards = [
+            os.path.join(data_root, f)
+            for f in sorted(os.listdir(data_root))
+        ]
+        assert len(shards) > 0, f"No shards found"
+
+        self.shards = shards
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.current_position = 0
+
+    def _load_next_shard(self):
+        self.current_shard = (self.current_shard + 1) % len(self.shards)
+        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        needed = B * T + 1
+
+        if self.current_position + needed > len(self.tokens):
+            self._load_next_shard()
+
+        buf = self.tokens[self.current_position : self.current_position + needed]
+
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        self.current_position += B * T
+        return x, y
+#------------------------------------------------------------------------------
+
+# Hyperparameters
+total_batch_size = 524288 # 2**19 tokens per optimizer step
+batch_size = 32 # micro-batch size
+sequence_length = 1024
+max_steps = 38 # 20M tokens / 524288 approx 38 steps
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Using device: {device}")
+
+# Calculate gradient accumulation steps
+assert total_batch_size % (batch_size * sequence_length) == 0, "total_batch_size must be divisible by batch_size * sequence_length"
+grad_accum_steps = total_batch_size // (batch_size * sequence_length)
+print(f"Total batch size: {total_batch_size}")
+print(f"Tokens per micro-batch: {batch_size * sequence_length}")
+print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# Data Loader
+data_root = "data/fineweb20M"
+if not os.path.exists(data_root):
+    print(f"Warning: {data_root} not found.")
+
+train_loader = TokenDataLoader(data_root, B=batch_size, T=sequence_length)
+
+# Model
+config = GPTConfig(context_length=sequence_length)
+model = GPT(config)
+model.to(device)
+
+# Optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# Training Loop
+model.train()
+step = 0
+
+# Start timing total training
+total_start_time = time.time()
+
+while step < max_steps:
+    t0 = time.time()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    
+    for micro_step in range(grad_accum_steps):
+        # Get batch
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        
+        # Forward pass
+        # Scale loss to account for accumulation
+        _, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        
+        # Backward pass
+        loss.backward()
+    
+    optimizer.step()
+    
+    # Wait for GPU to finish all queued operations for accurate timing
+    if device == "cuda": torch.cuda.synchronize()
+        
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # milliseconds
+    tokens_per_sec = total_batch_size / (t1 - t0)
+    
+    # Log: step:0 train_loss:10.8299 train_time:0ms token/s:
+    print(f"step:{step}/{max_steps} train_loss:{loss_accum.item():.4f} train_time:{dt:.0f}ms token/s:{tokens_per_sec:.2f}")
+    
+    step += 1
+
+# End timing total training
+total_end_time = time.time()
+total_time = total_end_time - total_start_time
+print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+print(f"Total tokens processed: {max_steps * total_batch_size:,}")
+print(f"Average tokens/sec: {(max_steps * total_batch_size) / total_time:.2f}")
+
+
+#------------------------------------------------------------------------------
+Using device: cuda
+Total batch size: 524288
+Tokens per micro-batch: 32768
+Gradient accumulation steps: 16
+step:0/38 train_loss:10.9231 train_time:31739ms token/s:16518.79
+step:1/38 train_loss:9.9797 train_time:31417ms token/s:16688.01
+step:2/38 train_loss:9.5502 train_time:31434ms token/s:16678.86
+step:3/38 train_loss:9.3340 train_time:31433ms token/s:16679.64
+step:4/38 train_loss:9.0988 train_time:31428ms token/s:16682.42
+step:5/38 train_loss:8.8988 train_time:31432ms token/s:16679.93
+step:6/38 train_loss:8.7112 train_time:31429ms token/s:16681.63
+step:7/38 train_loss:8.5374 train_time:31417ms token/s:16687.89
+step:8/38 train_loss:8.3866 train_time:31412ms token/s:16690.56
+step:9/38 train_loss:8.1642 train_time:31439ms token/s:16676.42
+step:10/38 train_loss:8.0759 train_time:31444ms token/s:16673.86
+step:11/38 train_loss:7.9250 train_time:31428ms token/s:16682.02
+step:12/38 train_loss:7.9044 train_time:31411ms token/s:16691.19
+step:13/38 train_loss:7.7676 train_time:31431ms token/s:16680.54
+step:14/38 train_loss:7.7539 train_time:31436ms token/s:16677.78
+step:15/38 train_loss:7.6246 train_time:31424ms token/s:16684.47
+step:16/38 train_loss:7.5647 train_time:31426ms token/s:16683.28
+step:17/38 train_loss:7.5757 train_time:31420ms token/s:16686.20
+step:18/38 train_loss:7.5154 train_time:31421ms token/s:16686.05
+step:19/38 train_loss:7.4672 train_time:31423ms token/s:16684.79
+step:20/38 train_loss:7.4129 train_time:31438ms token/s:16677.15
+step:21/38 train_loss:7.3946 train_time:31425ms token/s:16683.53
+step:22/38 train_loss:7.4215 train_time:31416ms token/s:16688.48
+step:23/38 train_loss:7.3270 train_time:31419ms token/s:16686.74
+step:24/38 train_loss:7.3699 train_time:31432ms token/s:16679.89
+step:25/38 train_loss:7.3122 train_time:31439ms token/s:16676.16
+step:26/38 train_loss:7.3861 train_time:31454ms token/s:16668.20
+step:27/38 train_loss:7.3164 train_time:31447ms token/s:16672.02
+step:28/38 train_loss:7.2916 train_time:31455ms token/s:16667.92
+step:29/38 train_loss:7.2586 train_time:31421ms token/s:16685.65
+step:30/38 train_loss:7.1719 train_time:31429ms token/s:16681.90
+step:31/38 train_loss:7.1892 train_time:31426ms token/s:16683.32
+step:32/38 train_loss:7.1733 train_time:31425ms token/s:16683.91
+step:33/38 train_loss:7.1964 train_time:31437ms token/s:16677.59
+step:34/38 train_loss:7.0765 train_time:31426ms token/s:16683.34
+step:35/38 train_loss:7.1955 train_time:31430ms token/s:16680.90
+step:36/38 train_loss:7.1388 train_time:31423ms token/s:16684.64
+step:37/38 train_loss:7.0427 train_time:31422ms token/s:16685.44
+Total time: 1194.62s (19.91 minutes)
+Total tokens processed: 19,922,944
+Average tokens/sec: 16677.23
