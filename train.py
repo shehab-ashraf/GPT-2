@@ -40,6 +40,9 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 model.train()
 step = 0
 
+# Start timing total training
+total_start_time = time.time()
+
 while step < max_steps:
     t0 = time.time()
     optimizer.zero_grad()
@@ -61,9 +64,8 @@ while step < max_steps:
     
     optimizer.step()
     
-    # Sync if using GPU
-    if device == "cuda":
-        torch.cuda.synchronize()
+    # Wait for GPU to finish all queued operations for accurate timing
+    if device == "cuda": torch.cuda.synchronize()
         
     t1 = time.time()
     dt = (t1 - t0) * 1000 # milliseconds
@@ -74,3 +76,9 @@ while step < max_steps:
     
     step += 1
 
+# End timing total training
+total_end_time = time.time()
+total_time = total_end_time - total_start_time
+print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+print(f"Total tokens processed: {max_steps * total_batch_size:,}")
+print(f"Average tokens/sec: {(max_steps * total_batch_size) / total_time:.2f}")
