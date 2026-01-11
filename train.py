@@ -28,6 +28,8 @@ if not os.path.exists(data_root):
 
 train_loader = TokenDataLoader(data_root, B=batch_size, T=sequence_length)
 
+torch.set_float32_matmul_precision('high')
+
 # Model
 config = GPTConfig(context_length=sequence_length)
 model = GPT(config)
