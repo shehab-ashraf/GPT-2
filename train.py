@@ -55,11 +55,11 @@ while step < max_steps:
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         
-        # Forward pass
-        # Scale loss to account for accumulation
-        _, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
+        # Forward pass with autocast
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            _, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
         
         # Backward pass
         loss.backward()
