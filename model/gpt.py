@@ -27,11 +27,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.embd_size, config.embd_size)
         self.n_head = config.num_heads
         self.n_embed = config.embd_size
-        
-        # Causal mask: lower triangular matrix to prevent attending to future tokens
-        self.register_buffer("mask", torch.tril(torch.ones(config.context_length, config.context_length))
-                                     .view(1, 1, config.context_length, config.context_length))
-        
+    
     def forward(self, x):
         B, T, C = x.size()  # Batch size, sequence length, embedding dimension
         
@@ -43,15 +39,15 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # Flash Attention: Fused, memory-efficient attention
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True
+        )
         
-        # Compute scaled dot-product attention scores
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # Apply causal mask to prevent attending to future positions
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        
-        # Apply attention to values: (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = att @ v
         # Concatenate all heads back together: (B, nh, T, hs) -> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
