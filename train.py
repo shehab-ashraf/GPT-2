@@ -34,6 +34,7 @@ torch.set_float32_matmul_precision('high')
 config = GPTConfig(context_length=sequence_length)
 model = GPT(config)
 model.to(device)
+model = torch.compile(model) # Enable torch.compile 
 
 # Optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
