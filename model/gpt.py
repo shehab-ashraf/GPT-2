@@ -14,6 +14,60 @@ class GPTConfig:
     embd_size: int = 768        # Embedding dimension
     num_heads: int = 12         # Number of attention heads
 
+class Rotary(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        # Calculate the inverse frequencies for the rotary embeddings
+        # This creates a sequence of frequencies [theta_0, theta_1, ...]
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        # Register as a buffer so it's part of the state_dict but not a parameter
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        # x is assumed to be (Batch, Seq_Len, Dim)
+        seq_len = x.shape[1]
+        
+        # Cache the sine and cosine values if sequence length changes
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            # Create position indices [0, 1, ..., seq_len-1]
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            # Compute outer product to get frequencies for each position
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            # Compute cos and sin values
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+            
+        # Return shapes aligned for broadcasting with (Batch, Heads, Time, Head_Dim)
+        # We need (1, 1, Time, Head_Dim/2) to broadcast correctly
+        return self.cos_cached[None, None, :, :], self.sin_cached[None, None, :, :]
+
+def apply_rotary_emb(x, cos, sin):
+    # Apply the rotary embeddings to the queries and keys
+    # x: (Batch, Heads, Time, Head_Dim)
+    # cos, sin: (1, 1, Time, Head_Dim/2)
+    
+    assert x.ndim == 4 # Ensure we are working with multihead attention format
+    d = x.shape[3]//2  # Split the dimension into two halves
+    
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    
+    # Apply rotation matrix:
+    # [x1, x2] * [[cos, -sin], [sin, cos]] = [x1*cos - x2*sin, x1*sin + x2*cos]
+    # Note: user provided implementation has signs:
+    # y1 = x1 * cos + x2 * sin
+    # y2 = x1 * (-sin) + x2 * cos
+    # This corresponds to a specific rotation direction.
+    
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    
+    return torch.cat([y1, y2], 3)
+
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention layer for autoregressive modeling."""
 
@@ -27,6 +81,11 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.embd_size, config.embd_size)
         self.n_head = config.num_heads
         self.n_embed = config.embd_size
+        
+        # Rotary Embedding setup
+        # Head size is embedding dimension divided by number of heads
+        self.head_size = config.embd_size // config.num_heads
+        self.rotary = Rotary(self.head_size)
     
     def forward(self, x):
         B, T, C = x.size()  # Batch size, sequence length, embedding dimension
@@ -39,6 +98,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # Apply Rotary Positional Embeddings
+        # Calculate cos and sin for the current sequence length
+        cos, sin = self.rotary(x) 
+        # Apply RoPE to queries and keys
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
         # Flash Attention: Fused, memory-efficient attention
         y = F.scaled_dot_product_attention(
@@ -99,7 +165,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.embd_size),    # Token embeddings
-            wpe = nn.Embedding(config.context_length, config.embd_size),  # Position embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),  # Transformer blocks
             ln_f = nn.LayerNorm(config.embd_size)  # Final layer norm before output
         ))
@@ -123,11 +188,8 @@ class GPT(nn.Module):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, block size is only {self.config.context_length}"
-        # forward the token and posisition embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
-        x = tok_emb + pos_emb
+        # forward the token embeddings
+        x = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
