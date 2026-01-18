@@ -68,6 +68,10 @@ def apply_rotary_emb(x, cos, sin):
     
     return torch.cat([y1, y2], 3)
 
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention layer for autoregressive modeling."""
 
@@ -143,17 +147,15 @@ class Block(nn.Module):
     
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.embd_size)  # Pre-normalization for attention
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.embd_size)  # Pre-normalization for MLP
         self.mlp = MLP(config)
         self.attn_scale = 1 / (2 * config.num_layers) ** 0.5
     
     def forward(self, x):
         # Attention with residual connection (pre-norm style)
-        x = x + self.attn_scale * self.attn(self.ln_1(x))
+        x = x + self.attn_scale * self.attn(norm(x))
         # MLP with residual connection (pre-norm style)
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.mlp(norm(x))
         return x
 
 class GPT(nn.Module):
@@ -166,12 +168,11 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.embd_size),    # Token embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),  # Transformer blocks
-            ln_f = nn.LayerNorm(config.embd_size)  # Final layer norm before output
         ))
         # Language modeling head: maps embeddings back to vocabulary logits
         self.lm_head = nn.Linear(config.embd_size, config.vocab_size, bias=False)
 
-        # weight sharing scheme (reduces 768*50267=~40M params, fewer params, more efficient)
+        # weight sharing scheme (reduces 768*50257=~40M params, fewer params, more efficient)
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
@@ -194,7 +195,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
+        x = norm(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         if return_logits:
