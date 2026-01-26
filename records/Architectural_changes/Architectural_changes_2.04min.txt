@@ -1,0 +1,565 @@
+# --- gpt.py ---
+from dataclasses import dataclass 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+@dataclass
+class GPTConfig:
+    """Configuration for GPT model architecture."""
+    context_length: int = 1024  # Maximum sequence length
+    vocab_size: int = 50304     # Size of vocabulary (padded to multiple of 64)
+    num_layers: int = 12        # Number of transformer blocks
+    embd_size: int = 768        # Embedding dimension
+    num_heads: int = 12         # Number of attention heads
+
+class Rotary(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        # Calculate the inverse frequencies for the rotary embeddings
+        # This creates a sequence of frequencies [theta_0, theta_1, ...]
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        # Register as a buffer so it's part of the state_dict but not a parameter
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        # x is assumed to be (Batch, Seq_Len, Dim)
+        seq_len = x.shape[1]
+        
+        # Cache the sine and cosine values if sequence length changes
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            # Create position indices [0, 1, ..., seq_len-1]
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            # Compute outer product to get frequencies for each position
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            # Compute cos and sin values
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+            
+        # Return shapes aligned for broadcasting with (Batch, Heads, Time, Head_Dim)
+        # We need (1, 1, Time, Head_Dim/2) to broadcast correctly
+        return self.cos_cached[None, None, :, :], self.sin_cached[None, None, :, :]
+
+def apply_rotary_emb(x, cos, sin):
+    # Apply the rotary embeddings to the queries and keys
+    # x: (Batch, Heads, Time, Head_Dim)
+    # cos, sin: (1, 1, Time, Head_Dim/2)
+    
+    assert x.ndim == 4 # Ensure we are working with multihead attention format
+    d = x.shape[3]//2  # Split the dimension into two halves
+    
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    
+    # Apply rotation matrix:
+    # [x1, x2] * [[cos, -sin], [sin, cos]] = [x1*cos - x2*sin, x1*sin + x2*cos]
+    # Note: user provided implementation has signs:
+    # y1 = x1 * cos + x2 * sin
+    # y2 = x1 * (-sin) + x2 * cos
+    # This corresponds to a specific rotation direction.
+    
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    
+    return torch.cat([y1, y2], 3)
+
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention layer for autoregressive modeling."""
+
+    def __init__(self, config):
+        super().__init__()
+        # Ensure embedding dimension is evenly divisible across all attention heads
+        assert config.embd_size % config.num_heads == 0, f"embedding dim should be divisible by number of heads"
+        # Key, query, value projections for all heads in a single batch operation
+        self.c_attn = nn.Linear(config.embd_size, 3 * config.embd_size)
+        # Output projection to bring multi-head results back to embedding dimension
+        self.c_proj = nn.Linear(config.embd_size, config.embd_size)
+        self.n_head = config.num_heads
+        self.n_embed = config.embd_size
+        
+        # Rotary Embedding setup
+        # Head size is embedding dimension divided by number of heads
+        self.head_size = config.embd_size // config.num_heads
+        self.rotary = Rotary(self.head_size)
+    
+    def forward(self, x):
+        B, T, C = x.size()  # Batch size, sequence length, embedding dimension
+        
+        # Compute query, key, value for all heads in one go
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embed, dim=2)
+        
+        # Reshape and transpose to separate heads: (B, T, C) -> (B, n_head, T, head_size)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # Apply Rotary Positional Embeddings
+        # Calculate cos and sin for the current sequence length
+        cos, sin = self.rotary(x) 
+        # Apply RoPE to queries and keys
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        # Flash Attention: Fused, memory-efficient attention
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True
+        )
+        
+        # Concatenate all heads back together: (B, nh, T, hs) -> (B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # Final output projection
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+    """Feed-forward network with GELU activation (4x expansion factor)."""
+
+    def __init__(self, config):
+        super().__init__()
+        # Expand to 4x embedding dimension
+        self.c_fc = nn.Linear(config.embd_size, 4 * config.embd_size)
+        # Project back to embedding dimension
+        self.c_proj = nn.Linear(4 * config.embd_size, config.embd_size)
+    
+    def forward(self, x):
+        x = self.c_fc(x)       # Expand
+        x = F.relu(x).square() # Non-linear activation
+        x = self.c_proj(x)     # Project back
+        return x
+
+class Block(nn.Module):
+    """Transformer block: LayerNorm -> Attention -> LayerNorm -> MLP, with residual connections."""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+        self.attn_scale = 1 / (2 * config.num_layers) ** 0.5
+    
+    def forward(self, x):
+        # Attention with residual connection (pre-norm style)
+        x = x + self.attn_scale * self.attn(norm(x))
+        # MLP with residual connection (pre-norm style)
+        x = x + self.mlp(norm(x))
+        return x
+
+class GPT(nn.Module):
+    """GPT Language Model: token + position embeddings -> transformer blocks -> language modeling head."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.embd_size),    # Token embeddings
+            h = nn.ModuleList([Block(config) for _ in range(config.num_layers)]),  # Transformer blocks
+        ))
+        # Language modeling head: maps embeddings back to vocabulary logits
+        self.lm_head = nn.Linear(config.embd_size, config.vocab_size, bias=False)
+
+        # weight sharing scheme (reduces 768*50257=~40M params, fewer params, more efficient)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def forward(self, idx, targets, return_logits=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.context_length, f"Cannot forward sequence of length {T}, block size is only {self.config.context_length}"
+        # forward the token embeddings
+        x = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = norm(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_logits:
+            return logits, loss
+        return None, loss
+
+# --- prepare.py ---
+"""
+FineWeb Preprocessing Script (10B Sample)
+
+This script downloads, tokenizes, and shards the FineWeb 10B dataset.
+It stores the results in .bin files, which includes a 1024-byte header.
+
+Usage Examples:
+
+1. Dev Mode (20M tokens):
+   python prepare.py --total_tokens 20000000 --shard_size 2000000
+   -> Output will be in 'fineweb20M'
+
+2. Full Training:
+   python prepare.py --shard_size 100000000
+   -> Output will be in 'fineweb10B'
+"""
+
+import os
+import argparse
+import numpy as np
+import tiktoken
+from datasets import load_dataset
+from tqdm import tqdm
+
+MAGIC = 20240520  
+VERSION = 1       
+HEADER_SIZE = 256 
+
+def write_shard(path, tokens: np.ndarray):
+    """Writes a list of tokens to a binary file with a header."""
+    assert tokens.dtype == np.uint16
+    
+    header = np.zeros(HEADER_SIZE, dtype=np.int32)
+    header[0] = MAGIC
+    header[1] = VERSION
+    header[2] = len(tokens) 
+
+    with open(path, "wb") as f:
+        f.write(header.tobytes())  
+        f.write(tokens.tobytes())  
+
+def main():
+    parser = argparse.ArgumentParser(description="Clean and simple FineWeb preprocessing")
+    parser.add_argument("--shard_size", type=int, default=100_000_000, 
+                        help="How many tokens per shard")
+    parser.add_argument("--total_tokens", type=int, default=None,
+                        help="How many tokens to process in total (leave empty for full dataset)")
+    parser.add_argument("--out_dir", type=str, default=None,
+                        help="Output directory (defaults to fineweb20M or fineweb10B)")
+    args = parser.parse_args()
+
+    remote_name = "sample-10BT"
+    
+    if args.out_dir:
+        out_dir = args.out_dir
+    elif args.total_tokens == 20_000_000:
+        out_dir = "data/fineweb20M"
+    else:
+        out_dir = "data/fineweb10B"
+        
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f"--- FineWeb Preprocessing (10B Sample) ---")
+    print(f"Output Directory : {out_dir}")
+    print(f"Total Tokens     : {args.total_tokens or 'ENTIRE DATASET'}")
+    print(f"Tokens per Shard : {args.shard_size:,}")
+
+
+    dataset = load_dataset(
+        "HuggingFaceFW/fineweb",
+        name=remote_name,
+        split="train",
+        streaming=True,
+    )
+
+    enc = tiktoken.get_encoding("gpt2")
+    eot = enc._special_tokens['<|endoftext|>'] 
+
+    def tokenize(text: str) -> np.ndarray:
+        """Tokenizes a string and adds an <|endoftext|> prefix."""
+        tokens = [eot]
+        tokens.extend(enc.encode_ordinary(text))
+        return np.array(tokens, dtype=np.uint16)
+
+    progress = tqdm(
+        total=args.total_tokens,
+        unit="tokens",
+        desc="Processing tokens",
+        disable=args.total_tokens is None,
+    )
+
+    shard_idx = 0
+    shard = np.empty(args.shard_size, dtype=np.uint16)
+    shard_pos = 0
+    total_processed = 0
+    
+    total_limit = args.total_tokens if args.total_tokens is not None else float('inf')
+
+    for doc in dataset:
+        if total_processed >= total_limit:
+            break
+            
+        tokens = tokenize(doc["text"])
+        pos = 0
+        
+        while pos < len(tokens) and total_processed < total_limit:
+            space_left = args.shard_size - shard_pos
+            
+            if space_left == 0:
+                shard_path = os.path.join(out_dir, f"fineweb_{shard_idx:06d}.bin")
+                write_shard(shard_path, shard)
+                shard_idx += 1
+                shard_pos = 0
+                space_left = args.shard_size
+            
+            take = min(space_left, len(tokens) - pos, total_limit - total_processed)
+            
+            shard[shard_pos:shard_pos + take] = tokens[pos:pos + take]
+            
+            shard_pos += take
+            pos += take
+            total_processed += take
+            progress.update(take)
+
+    if shard_pos > 0:
+        shard_path = os.path.join(out_dir, f"fineweb_{shard_idx:06d}.bin")
+        write_shard(shard_path, shard[:shard_pos])
+
+    progress.close()
+
+if __name__ == "__main__":
+    main()
+
+# --- dataloader.py ---
+import numpy as np
+import torch
+import os
+
+def load_tokens_bin(filename, dtype=np.uint16, offset_bytes=256):
+    npt = np.memmap(
+        filename,
+        dtype=dtype,
+        mode="r",
+        offset=offset_bytes
+    )
+    return torch.from_numpy(npt.astype(np.int32)).long()
+
+class TokenDataLoader:
+    
+    def __init__(self, data_root, B, T):
+        self.B = B
+        self.T = T
+
+        shards = [
+            os.path.join(data_root, f)
+            for f in sorted(os.listdir(data_root))
+        ]
+        assert len(shards) > 0, f"No shards found"
+
+        self.shards = shards
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.current_position = 0
+
+    def _load_next_shard(self):
+        self.current_shard = (self.current_shard + 1) % len(self.shards)
+        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        needed = B * T + 1
+
+        if self.current_position + needed > len(self.tokens):
+            self._load_next_shard()
+
+        buf = self.tokens[self.current_position : self.current_position + needed]
+
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        self.current_position += B * T
+        return x, y
+
+# --- train.py ---
+import os
+import time
+import sys
+from datetime import datetime
+import torch
+import torch.nn as nn
+from model.gpt import GPT, GPTConfig
+from data.dataloader import TokenDataLoader
+
+# --- Recording Setup ---
+class Logger(object):
+    def __init__(self, log_path, code_files):
+        self.terminal = sys.stdout
+        self.log = open(log_path, "w", encoding="utf-8")
+        
+        # Log the source code of the specified files
+        for fpath in code_files:
+            if os.path.exists(fpath):
+                with open(fpath, "r", encoding="utf-8") as f:
+                    self.log.write(f"# --- {fpath} ---\n")
+                    self.log.write(f.read())
+                    self.log.write("\n\n")
+        self.log.write("# --- OUTPUT ---\n")
+        self.log.flush()
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# Create records directory
+os.makedirs("records", exist_ok=True)
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join("records", f"Run_{run_id}")
+os.makedirs(run_dir, exist_ok=True)
+log_path = os.path.join(run_dir, "run_log.txt")
+
+# Redirect stdout to both terminal and log file
+sys.stdout = Logger(log_path, ["train.py", "model/gpt.py", "data/dataloader.py"])
+# -----------------------
+
+# Hyperparameters
+total_batch_size = 524288 # 2**19 tokens per optimizer step
+batch_size = 32 # micro-batch size
+sequence_length = 1024
+max_steps = 38 # 20M tokens / 524288 approx 38 steps
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Using device: {device}")
+
+# Calculate gradient accumulation steps
+assert total_batch_size % (batch_size * sequence_length) == 0, "total_batch_size must be divisible by batch_size * sequence_length"
+grad_accum_steps = total_batch_size // (batch_size * sequence_length)
+print(f"Total batch size: {total_batch_size}")
+print(f"Tokens per micro-batch: {batch_size * sequence_length}")
+print(f"Gradient accumulation steps: {grad_accum_steps}")
+
+# Data Loader
+data_root = "data/fineweb20M"
+if not os.path.exists(data_root):
+    print(f"Warning: {data_root} not found.")
+
+train_loader = TokenDataLoader(data_root, B=batch_size, T=sequence_length)
+
+torch.set_float32_matmul_precision('high')
+
+# Model
+config = GPTConfig(context_length=sequence_length)
+model = GPT(config)
+model.to(device)
+model = torch.compile(model) # Enable torch.compile 
+
+# Optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+# Training Loop
+model.train()
+step = 0
+
+# Start timing total training
+total_start_time = time.time()
+
+while step < max_steps:
+    t0 = time.time()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    
+    for micro_step in range(grad_accum_steps):
+        # Get batch
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        
+        # Forward pass with autocast
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            _, loss = model(x, y)
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+        
+        # Backward pass
+        loss.backward()
+    
+    optimizer.step()
+    
+    # Wait for GPU to finish all queued operations for accurate timing
+    if device == "cuda": torch.cuda.synchronize()
+        
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # milliseconds
+    tokens_per_sec = total_batch_size / (t1 - t0)
+    
+    # Log: step:0 train_loss:10.8299 train_time:0ms token/s:
+    print(f"step:{step}/{max_steps} train_loss:{loss_accum.item():.4f} train_time:{dt:.0f}ms token/s:{tokens_per_sec:.2f}")
+    
+    step += 1
+
+# End timing total training
+total_end_time = time.time()
+total_time = total_end_time - total_start_time
+print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} minutes)")
+print(f"Total tokens processed: {max_steps * total_batch_size:,}")
+print(f"Average tokens/sec: {(max_steps * total_batch_size) / total_time:.2f}")
+
+# --- OUTPUT ---
+Using device: cuda
+Total batch size: 524288
+Tokens per micro-batch: 32768
+Gradient accumulation steps: 16
+step:0/38 train_loss:10.9611 train_time:28053ms token/s:18689.47
+step:1/38 train_loss:10.0001 train_time:2527ms token/s:207467.96
+step:2/38 train_loss:9.5698 train_time:2534ms token/s:206897.14
+step:3/38 train_loss:9.3274 train_time:2531ms token/s:207113.21
+step:4/38 train_loss:9.0771 train_time:2541ms token/s:206298.04
+step:5/38 train_loss:8.8704 train_time:2544ms token/s:206099.30
+step:6/38 train_loss:8.6572 train_time:2540ms token/s:206448.90
+step:7/38 train_loss:8.4815 train_time:2539ms token/s:206521.51
+step:8/38 train_loss:8.3296 train_time:2542ms token/s:206280.14
+step:9/38 train_loss:8.1051 train_time:2543ms token/s:206171.66
+step:10/38 train_loss:8.0387 train_time:2543ms token/s:206165.23
+step:11/38 train_loss:7.8872 train_time:2545ms token/s:206005.25
+step:12/38 train_loss:7.8513 train_time:2544ms token/s:206055.15
+step:13/38 train_loss:7.7340 train_time:2542ms token/s:206223.65
+step:14/38 train_loss:7.7123 train_time:2544ms token/s:206062.41
+step:15/38 train_loss:7.5737 train_time:2545ms token/s:206000.51
+step:16/38 train_loss:7.5176 train_time:2547ms token/s:205849.57
+step:17/38 train_loss:7.5123 train_time:2547ms token/s:205884.57
+step:18/38 train_loss:7.4652 train_time:2551ms token/s:205526.45
+step:19/38 train_loss:7.3996 train_time:2552ms token/s:205456.24
+step:20/38 train_loss:7.3548 train_time:2552ms token/s:205465.27
+step:21/38 train_loss:7.3288 train_time:2551ms token/s:205500.16
+step:22/38 train_loss:7.3580 train_time:2553ms token/s:205370.13
+step:23/38 train_loss:7.2509 train_time:2555ms token/s:205207.00
+step:24/38 train_loss:7.2945 train_time:2555ms token/s:205222.55
+step:25/38 train_loss:7.2243 train_time:2556ms token/s:205092.26
+step:26/38 train_loss:7.2929 train_time:2561ms token/s:204706.66
+step:27/38 train_loss:7.2197 train_time:2565ms token/s:204431.63
+step:28/38 train_loss:7.1996 train_time:2566ms token/s:204359.99
+step:29/38 train_loss:7.1581 train_time:2562ms token/s:204609.07
+step:30/38 train_loss:7.0884 train_time:2559ms token/s:204875.49
+step:31/38 train_loss:7.1202 train_time:2565ms token/s:204377.31
+step:32/38 train_loss:7.0780 train_time:2563ms token/s:204566.53
+step:33/38 train_loss:7.1080 train_time:2565ms token/s:204361.78
+step:34/38 train_loss:6.9753 train_time:2561ms token/s:204689.02
+step:35/38 train_loss:7.0938 train_time:2563ms token/s:204556.86
+step:36/38 train_loss:7.0341 train_time:2563ms token/s:204547.04
+step:37/38 train_loss:6.9435 train_time:2564ms token/s:204483.42
+Total time: 122.44s (2.04 minutes)
+Total tokens processed: 19,922,944
+Average tokens/sec: 162718.63
