@@ -9,7 +9,7 @@ import math
 class GPTConfig:
     """Configuration for GPT model architecture."""
     context_length: int = 1024  # Maximum sequence length
-    vocab_size: int = 50257     # Size of vocabulary
+    vocab_size: int = 50304     # Size of vocabulary (padded to multiple of 64)
     num_layers: int = 12        # Number of transformer blocks
     embd_size: int = 768        # Embedding dimension
     num_heads: int = 12         # Number of attention heads
@@ -132,13 +132,12 @@ class MLP(nn.Module):
         super().__init__()
         # Expand to 4x embedding dimension
         self.c_fc = nn.Linear(config.embd_size, 4 * config.embd_size)
-        self.gelu = nn.GELU()
         # Project back to embedding dimension
         self.c_proj = nn.Linear(4 * config.embd_size, config.embd_size)
     
     def forward(self, x):
-        x = self.c_fc(x)      # Expand
-        x = self.gelu(x)       # Non-linear activation
+        x = self.c_fc(x)       # Expand
+        x = F.relu(x).square() # Non-linear activation
         x = self.c_proj(x)     # Project back
         return x
 
