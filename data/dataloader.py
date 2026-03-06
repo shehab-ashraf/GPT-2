@@ -1,15 +1,20 @@
 import numpy as np
 import torch
 import os
+from pathlib import Path
 
-def load_tokens_bin(filename, dtype=np.uint16, offset_bytes=256):
-    npt = np.memmap(
-        filename,
-        dtype=dtype,
-        mode="r",
-        offset=offset_bytes
-    )
-    return torch.from_numpy(npt.astype(np.int32)).long()
+def load_tokens(filename):
+    file_path = Path(filename)
+    header = torch.from_file(str(file_path), False, 256, dtype=torch.int32)
+    num_tokens = int(header[2])
+    
+    tokens = torch.empty(num_tokens, dtype=torch.int16, pin_memory=True)
+    
+    with file_path.open("rb", buffering=0) as f:
+        f.seek(256 * 4)
+        f.readinto(tokens.numpy())
+    
+    return tokens
 
 class TokenDataLoader:
     
@@ -28,12 +33,12 @@ class TokenDataLoader:
 
     def reset(self):
         self.current_shard = 0
-        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = 0
 
     def _load_next_shard(self):
         self.current_shard = (self.current_shard + 1) % len(self.shards)
-        self.tokens = load_tokens_bin(self.shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = 0
 
     def next_batch(self):
