@@ -54,7 +54,8 @@ while step < max_steps:
     for micro_step in range(grad_accum_steps):
         # Get batch
         x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        x = x.to(device, dtype=torch.long, non_blocking=True)
+        y = y.to(device, dtype=torch.long, non_blocking=True)
         
         # Forward pass with autocast
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
