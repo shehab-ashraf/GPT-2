@@ -1,13 +1,6 @@
 # nanogpt
 
-I trained a 124M-parameter large language model from scratch on FineWeb-10B.
-
-I built a 124M-parameter GPT-2 from scratch in PyTorch and incrementally 
-replaced every 2019-era component with its modern
-version: FlashAttention varlen with packed documents and per-document causal
-masking, RoPE, RMSNorm, QK-norm, squared ReLU,
-U-Net skip connections, Gemma-style logit soft-capping, and a
-Muon + AdamW optimizer split.
+I built a 124M-parameter GPT-2-class model from scratch in PyTorch and trained it on FineWeb-10B. I incrementally replaced every 2019-era component with its modern equivalent: FlashAttention varlen with packed documents and per-document causal masking, RoPE, RMSNorm, QK-norm, squared ReLU, U-Net skip connections, Gemma-style logit soft-capping, and a [Muon] + AdamW optimizer split.
 
 3,000 steps on 2× A100, ~70 minutes of training, and it hits **70% MFU** at
 375,000 tok/s. It reaches 40.50 perplexity on WikiText-2 vs. OpenAI's 25.2
