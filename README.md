@@ -2,12 +2,12 @@
 
 I trained a 124M-parameter large language model from scratch on FineWeb-10B.
 
-I started from Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT)
-baseline and incrementally replaced every 2019-era component with its modern
+I built a 124M-parameter GPT-2 from scratch in PyTorch and incrementally 
+replaced every 2019-era component with its modern
 version: FlashAttention varlen with packed documents and per-document causal
 masking, RoPE, RMSNorm, QK-norm, squared ReLU,
 U-Net skip connections, Gemma-style logit soft-capping, and a
-[Muon](https://github.com/KellerJordan/modded-nanogpt) + AdamW optimizer split.
+Muon + AdamW optimizer split.
 
 3,000 steps on 2× A100, ~70 minutes of training, and it hits **70% MFU** at
 375,000 tok/s. It reaches 40.50 perplexity on WikiText-2 vs. OpenAI's 25.2
@@ -23,7 +23,7 @@ First, navigate to the folder where you keep your projects and clone this
 repository:
 
 ```bash
-git clone https://github.com/shehab-ashraf/GPT-2.git && cd GPT-2
+git clone https://github.com/shehab-ashraf/nanogpt.git && cd nanogpt
 ```
 
 Then, let's run an inference to see it in action:
