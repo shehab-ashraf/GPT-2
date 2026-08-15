@@ -4,7 +4,6 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
-.python-version
 
 # Virtual environments
 .venv/
@@ -33,6 +32,7 @@ Thumbs.db
 
 # Training artifacts / checkpoints
 checkpoints/
+out/
 *.pt
 *.pth
 *.ckpt
