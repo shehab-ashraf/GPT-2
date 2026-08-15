@@ -1,78 +1,124 @@
 # nanogpt
 
-Training a 124M parameter large language model.
+I trained a 124M-parameter large language model from scratch on FineWeb-10B.
 
-This is a complete train + inference for a modernized GPT-2 architecture, with a focus on maximum speed and training stability. I kept the classic 124M parameter footprint from the 2019 GPT-2, but completely rebuilt the internals using modern LLM architecture choices (RoPE, RMSNorm, FlashAttention, Muon, U-Net skips).
+I started from Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT)
+baseline and incrementally replaced every 2019-era component with its modern
+version: FlashAttention varlen with packed documents and per-document causal
+masking, RoPE, RMSNorm, QK-norm, squared ReLU,
+U-Net skip connections, Gemma-style logit soft-capping, and a
+[Muon](https://github.com/KellerJordan/modded-nanogpt) + AdamW optimizer split.
 
-Read the full technical deep dive on my [blog](https://shehab-ashraf.github.io/posts/nanogpt/) or check out the raw training logs on [WandB](https://wandb.ai/ashrafshehab-/nanoGPT).
+3,000 steps on 2× A100, ~70 minutes of training, and it hits **70% MFU** at
+375,000 tok/s. It reaches 40.50 perplexity on WikiText-2 vs. OpenAI's 25.2
+with ~40B tokens. Not close yet, but it's learning fast on far less data.
 
-## quickstart
+- Blog (deep dive): <https://shehab-ashraf.github.io/posts/nanogpt/>
+- Weights & Biases: <https://wandb.ai/ashrafshehab-/nanoGPT>
+- Pretrained weights: <https://huggingface.co/ashrafs1/nanogpt-3000>
 
-First, navigate to the folder where you keep your projects and clone this repository:
+## feel the magic
+
+First, navigate to the folder where you keep your projects and clone this
+repository:
 
 ```bash
-git clone https://github.com/shehab-ashraf/GPT-2.git
-cd GPT-2
-pip install -r requirements.txt
+git clone https://github.com/shehab-ashraf/GPT-2.git && cd GPT-2
 ```
 
-Then, let's run a quick CPU inference to see it in action:
+Then, let's run an inference to see it in action:
 
 ```bash
-python -m src.inference.sample --start "What is the answer to life, the universe, and everything?"
+uv sync --extra eval
+uv run python -m src.infer --start "What is the answer to life, the universe, and everything?"
 ```
 
-You'll see the text stream a sample:
+And it streams back:
 
-> prompt: What is the answer to life, the universe, and everything?
-> generated_text: The answer is yes. What can I do for my life, my family or even a little piece of me with all that I have lost in this time? How could I have changed that and made it work again on my own? How could I have made some changes to my life over the years so that it has been taken into account when it comes back from this loss? How could I make myself more productive? In addition, what would be my priority if I had no other words to say to me now? Would I choose to follow up any of these things and give up? What would happen if someone else was involved in my
+```
+prompt: What is the answer to life, the universe, and everything?
+generated_text: The answer is yes. What can I do for my life, my family or even a little piece of me with all that I have lost in this time? How could I have changed that and made it work again on my own? How could I have made some changes to my life over the years so that it has been taken into account when it comes back from this loss? How could I make myself more productive? In addition, what would be my priority if I had no other words to say to me now? Would I choose to follow up any of these things and give up? What would happen if someone else was involved in my
+```
 
-## performance
 
-How good is it actually? I benchmarked it head-to-head against the official OpenAI GPT-2 on the WikiText-2 dataset using a sliding-window evaluation:
+## how good is it
 
-* nanoGPT (3,000 steps): `42.15` perplexity 
-* OpenAI GPT-2 (124M): `25.17` perplexity
+I benchmarked it head-to-head against the official OpenAI GPT-2 on WikiText-2,
+sliding-window perplexity:
 
-The official GPT-2 was trained on roughly 40 billion tokens. This 3,000-step checkpoint only read ~1.5 billion tokens (over 25x less data). The architecture upgrades massively accelerate learning efficiency, but it just needs more data to fully close the gap.
+| model | tokens trained | WikiText-2 PPL |
+| --- | ---: | ---: |
+| OpenAI GPT-2 (124M) | ~40 B | 25.2 |
+| **nanoGPT (3,000 steps)** | ~1.57 B | 40.50 |
 
-**Training Stats** (Single A100 GPU):
-* Hardware: 1x NVIDIA A100
-* Time: ~2 hours
-* Throughput: ~200,000 tokens/sec
-* MFU: ~37.8%
-* Best Validation Loss: `3.3110`
+The architecture upgrades accelerate learning, but it needs more data to
+fully close the gap.
 
-## model
+## what's inside
 
-The model follows the GPT-2 124M parameter footprint but incorporates several modern improvements for better speed and stability:
+The 2019 GPT-2 internals were rebuilt with modern components:
 
-* **RoPE** relative position encodings
-* **RMSNorm** instead of LayerNorm
-* **Squared ReLU** activation
-* **Vocab 50,304** (Tensor Core optimized)
-* **U-Net skip connections**
-* **QK-norm + FlashAttention**
-* **Logit soft-capping** (Gemma-style)
-* **Muon + AdamW** optimizers
+- **Muon + AdamW**: [Muon](https://github.com/KellerJordan/modded-nanogpt) (Newton-Schulz orthogonalized momentum) for all 2-D matrix weights; AdamW for the embeddings and 1-D params. Best of both worlds.
+- **FlashAttention-2 (varlen)**: packed documents, per-document causal masking via `cu_seqlens`, **zero padding waste**. Flash-attn only, run on CUDA.
+- **RoPE**: replacing absolute positional embeddings.
+- **RMSNorm** + **QK-norm**: replacing LayerNorm and raw attention logits.
+- **Squared ReLU**: the MLP activation.
+- **U-Net skip connections**: first half of the blocks saves activations, second half adds them back.
+- **Logit soft-capping**: Gemma-style `30 * tanh(logits / 30)` for stability.
+- **Vocab 50,304**: padded to a multiple of 128 for tensor-core efficiency.
+- **bf16 compute, TF32 matmul, `torch.compile`**: forwards/backwards run under bf16 `autocast`, `set_float32_matmul_precision("high")` lets fp32 matmuls ride the tensor cores as TF32, and the whole graph is fused by `torch.compile`.
 
-Training: micro batch 64, seq 2048, total batch 524k tokens/step, 3000 steps, trapezoidal LR schedule. Muon LR 0.02, AdamW LR 0.006, bf16/TF32 precision.
+## models
+
+Pretrained checkpoints on the Hub, in plain `model.safetensors` + `config.json` form:
+
+| run | steps | tokens | WikiText-2 PPL | download |
+| --- | ---: | ---: | ---: | --- |
+| nanogpt-3000 | 3,000 | ~1.57 B | 40.50 | [ashrafs1/nanogpt-3000s](https://huggingface.co/ashrafs1/nanogpt-3000s) |
+
 
 ## train it yourself
 
-I use Lightning AI for training because it gives me access to A100 GPUs. First set up the environment:
+One launcher handles `uv sync`, FineWeb-10B shard download, and single- or two-GPU DDP training. Designed for A100 40GB (peaks at 32.9 GB).
 
-```bash
-bash scripts/setup.sh
+```bash 
+NPROC=2 TOTAL_STEPS=3000 WANDB_RUN=nanogpt-3000 bash runs/speedrun.sh 
 ```
 
-Download the 10B subset of FineWeb and start training:
+Environment controls:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `NPROC` | `1` | Number of A100 GPUs |
+| `TOTAL_STEPS` | `3000` | Optimizer steps |
+| `MICRO_BATCH` | `32` | Sequences per GPU per micro-batch |
+| `RUN_NAME` | `nanogpt-3000` | Output directory under `out/` |
+| `RESUME` | `0` | `1` resumes from `ckpt_last.pt` |
+| `WANDB_RUN` | unset | Enables W&B logging when set |
+| `DOWNLOAD_SHARDS` | `50` | FineWeb train shards to keep locally |
+
+Extra `src.train` flags pass through at the end:
 
 ```bash
-python -m src.data.download --shards 50
-python -m src.train
+NPROC=2 TOTAL_STEPS=6000 bash runs/speedrun.sh --eval-every 250
 ```
+  
+### the recipe
+
+- **Batch**: 524,288 global tokens / step. Micro-batch 32 × seq 2048 × grad-accum, DDP-all-reduced. 3,000 steps → ~1.57 B tokens seen.
+- **Schedule**: trapezoidal LR. Linear warmup → constant → linear cooldown.
+- **Optimizers**: Muon LR 0.02 (weight-decay 0.01, momentum 0.95); AdamW LR 0.0036 (weight-decay 0.1, β1 0.9, β2 0.95).
+- **Eval**: every 250 steps on 10.49 M tokens.
+
+
 
 ## ack
 
-Architecture and training recipe heavily inspired by [Keller Jordan](https://github.com/KellerJordan/modded-nanogpt)'s modded-nanogpt speedrun and [Tyler Romero](https://github.com/tyler-romero)'s contributions. Built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT). Sebastian Raschka's [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) was a great learning resource.
+Architecture and training recipe heavily inspired by
+[Keller Jordan](https://github.com/KellerJordan/modded-nanogpt)'s modded-nanogpt
+speedrun and [Tyler Romero](https://github.com/tyler-romero)'s contributions,
+built on top of Andrej Karpathy's
+[nanoGPT](https://github.com/karpathy/nanoGPT) and
+[llm.c](https://github.com/karpathy/llm.c). Sebastian Raschka's
+[LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) was a great
+learning resource.
