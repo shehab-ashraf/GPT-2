@@ -1,0 +1,62 @@
+[project]
+name = "nanogpt"
+version = "0.2.0"
+description = "124M nanogPT model on packed FineWeb-10B shards"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Shehab Ashraf" }]
+
+dependencies = [
+    "torch==2.8.0",
+    "flash-attn==2.8.3.post1",
+    "liger-kernel>=0.5.10",
+    "triton>=3.0",
+    "numpy>=1.26,<3.0",
+    "tiktoken==0.7.0",
+    "huggingface-hub>=0.24.6",
+    "wandb>=0.18",
+    "tqdm>=4.66",
+]
+
+# Only needed for eval/infer (wikitext PPL / sampling): `uv sync --extra eval`.
+[project.optional-dependencies]
+eval = [
+    "transformers>=4.44",
+    "datasets>=3.0",
+    "safetensors>=0.4.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+flash-attn = [{ index = "astral-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "astral-cu128"
+url = "https://wheels.astral.sh/simple/cu128/"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["cache", "records"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C4"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/data/download.py" = ["C4"]
